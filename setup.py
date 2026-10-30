@@ -1,15 +1,13 @@
 import mujoco
 import mujoco.viewer
-from lerobot.envs.factory import make_env
+from tabletop_env.env import make_env
 
-# Load the LeRobot environment
+# Load the project-local SO-101 tabletop environment.
 envs = make_env(
-    "lerobot/so101-tabletop-mujoco",
     n_envs=1,
-    trust_remote_code=True,
 )
 
-# Access the actual SO-101 environment
+# Access the SO-101 environment
 vec_env = envs["so101_tabletop"][0]
 robot_env = vec_env.envs[0].unwrapped
 
