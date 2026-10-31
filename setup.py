@@ -1,14 +1,18 @@
 import mujoco
 import mujoco.viewer
-from tabletop_env.env import make_env
+from tabletop_env.env import make_push_env
 
-# Load the project-local SO-101 tabletop environment.
-envs = make_env(
+# Cube variant to load: "wood", "steel", "rubber" or "ice" (see CUBE_VARIANTS in env.py).
+CUBE = "ice"
+
+# Load the single-cube push scene with that cube.
+envs = make_push_env(
     n_envs=1,
+    variants=[CUBE],
 )
 
 # Access the SO-101 environment
-vec_env = envs["so101_tabletop"][0]
+vec_env = envs[f"so101_push_{CUBE}"][0]
 robot_env = vec_env.envs[0].unwrapped
 
 # Initialize the simulation and robot

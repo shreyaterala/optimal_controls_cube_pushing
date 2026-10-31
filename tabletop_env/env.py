@@ -43,6 +43,8 @@ HERE = Path(__file__).absolute().parent
 # Bundled from MuJoCo Menagerie at commit 0059d4335f8156206f63a35662313385f7ad6d74.
 MENAGERIE_MODEL = "robotstudio_so101"
 SCENE_FILE = "so101_tabletop.xml"
+# One cube pushed onto a flat target; its physics come from CUBE_VARIANTS.
+PUSH_SCENE_FILE = "so101_push.xml"
 MOUNT_SITE = "so101_mount"
 INSTRUCTION_TEXT = "instruction"
 # The arm's 3D-printed parts: turquoise like the LeRobot kits instead of Menagerie's yellow.
@@ -62,7 +64,18 @@ LEROBOT_SIM = {
     "state_names": JOINT_NAMES,
     "action_names": JOINT_NAMES,
 }
-CUBE_BODIES = ("red_cube", "green_cube", "blue_cube", "yellow_cube")
+# Cube bodies the task tracks; each scene defines a subset (the tabletop four, the push scene one).
+CUBE_BODIES = ("red_cube", "green_cube", "blue_cube", "yellow_cube", "cube")
+# The geom whose mass, friction and material a cube variant sets.
+CUBE_GEOM = "cube_geom"
+# Physical cube variants for a 3 cm cube: mass in kg, friction as (sliding, torsional, rolling), and a
+# material the scene defines. The cube geom's priority makes its friction set the table contact.
+CUBE_VARIANTS: dict[str, dict[str, Any]] = {
+    "wood": {"mass": 0.016, "friction": (0.6, 0.01, 0.001), "material": "red_wood"},
+    "steel": {"mass": 0.21, "friction": (0.4, 0.005, 0.0001), "material": "steel"},
+    "rubber": {"mass": 0.03, "friction": (1.2, 0.03, 0.003), "material": "rubber"},
+    "ice": {"mass": 0.025, "friction": (0.05, 0.001, 0.0001), "material": "ice"},
+}
 BOX_BODY = "box"
 # A cube is in the box when its center is within the box's inner footprint (in the box frame) and
 # below 6 cm: resting on the box floor or on another cube, not held above the box.
@@ -84,9 +97,27 @@ def repo_root() -> Path:
     return Path(snapshot_download(REPO_ID, revision=revision))
 
 
-def build_model(scene: Path, root: Path) -> mujoco.MjModel:
-    """Compile the scene with the Menagerie arm attached at its mount site."""
+def build_model(scene: Path, root: Path, cube: Mapping[str, Any] | None = None) -> mujoco.MjModel:
+    """Compile the scene with the Menagerie arm attached at its mount site and the cube variant applied.
+
+    The variant is set on the geom before compiling, so MuJoCo recomputes the cube's inertia from its mass.
+    """
     spec = mujoco.MjSpec.from_file(str(scene))
+    if cube is not None:
+        unknown = set(cube) - {"mass", "friction", "material"}
+        if unknown:
+            raise ValueError(f"Unknown cube keys {sorted(unknown)}; expected mass, friction, material")
+        geom = spec.geom(CUBE_GEOM)
+        if geom is None:
+            raise ValueError(f"cube is set, but scene {scene.name} has no {CUBE_GEOM!r} geom")
+        if "mass" in cube:
+            geom.mass = float(cube["mass"])
+        if "friction" in cube:
+            geom.friction = [float(value) for value in cube["friction"]]
+        if "material" in cube:
+            if spec.material(cube["material"]) is None:
+                raise ValueError(f"cube material {cube['material']!r} is not defined in {scene.name}")
+            geom.material = cube["material"]
     arm = mujoco.MjSpec.from_file(str(root / MENAGERIE_MODEL / "so101.xml"))
     for material in arm.materials:
         if not material.name.startswith("sts3215"):
@@ -133,15 +164,22 @@ class _World:
         width: int,
         randomize: Mapping,
         camera_fovy: Mapping[str, float],
+        cube: Mapping[str, Any] | None = None,
     ):
-        self.model = build_model(scene, root)
+        self.model = build_model(scene, root, cube)
         # The control period must be a whole number of physics steps.
         self.substeps = max(1, round(1 / (fps * self.model.opt.timestep)))
         self.model.opt.timestep = 1 / (fps * self.substeps)
         self.data = mujoco.MjData(self.model)
         self.renderer = mujoco.Renderer(self.model, height, width)
         self.qadr = np.array([self.model.joint(name).qposadr[0] for name in JOINTS])
-        self.cube_bodies = [self._id(mujoco.mjtObj.mjOBJ_BODY, name, "the task") for name in CUBE_BODIES]
+        self.cube_bodies = [
+            body
+            for body in (mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name) for name in CUBE_BODIES)
+            if body >= 0
+        ]
+        if not self.cube_bodies:
+            raise ValueError(f"the task needs at least one of the bodies {CUBE_BODIES}")
         self.box_body = self._id(mujoco.mjtObj.mjOBJ_BODY, BOX_BODY, "the task")
         self.actuators = np.array([self.model.actuator(name).id for name in JOINTS])
         self.lo, self.hi = self.model.actuator_ctrlrange[self.actuators].T.copy()
@@ -294,6 +332,7 @@ class SO101Env(gym.Env):
         initial_joints: Sequence[float] = HOME,
         randomize: Mapping[str, Any] | None = None,
         camera_fovy: Mapping[str, float] | None = None,
+        cube: str | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         # None: the repository's tabletop scene, located on first use.
@@ -313,6 +352,12 @@ class SO101Env(gym.Env):
         self.randomize = dict(randomize or {})
         # MJCF camera name -> vertical field of view in degrees, e.g. to widen the arm's wrist_cam.
         self.camera_fovy = dict(camera_fovy or {})
+        # A CUBE_VARIANTS name or a {mass, friction, material} mapping; None keeps the scene's cube.
+        if isinstance(cube, str):
+            if cube not in CUBE_VARIANTS:
+                raise ValueError(f"Unknown cube variant {cube!r}; expected one of {sorted(CUBE_VARIANTS)}")
+            cube = CUBE_VARIANTS[cube]
+        self.cube = dict(cube) if cube is not None else None
         self._world: _World | None = None
 
         image = spaces.Box(0, 255, (self.height, self.width, 3), np.uint8)
@@ -343,6 +388,7 @@ class SO101Env(gym.Env):
                 self.width,
                 self.randomize,
                 self.camera_fovy,
+                self.cube,
             )
         return self._world
 
@@ -375,10 +421,10 @@ class SO101Env(gym.Env):
         mujoco.mj_step(world.model, world.data, nstep=world.substeps)
         self._steps += 1
         in_box = world.cubes_in_box()
-        success = in_box == len(CUBE_BODIES)
+        success = in_box == len(world.cube_bodies)
         truncated = self._steps >= self._max_episode_steps
         info = {"is_success": success, "cubes_in_box": in_box}
-        return self._obs(world), in_box / len(CUBE_BODIES), success, truncated, info
+        return self._obs(world), in_box / len(world.cube_bodies), success, truncated, info
 
     def close(self) -> None:
         if self._world is not None:
@@ -408,3 +454,32 @@ def make_env(n_envs: int = 1, use_async_envs: bool = False, **kwargs: Any) -> di
     factory = partial(SO101Env, **{**DEFAULTS, **kwargs})
     vector_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
     return {"so101_tabletop": {0: vector_cls([factory] * n_envs)}}
+
+
+# Seeded reset randomization of the push scene: the cube starts somewhere in front of the target.
+PUSH_DEFAULTS: dict[str, Any] = {
+    "cameras": {"front": "front", "wrist": "wrist_cam"},
+    "randomize": {
+        "joints": 2.0,
+        "bodies": {"cube": {"pos": [0.04, 0.04, 0.0], "yaw": 3.1416}},
+        "cameras": {"front": {"pos": [0.01, 0.01, 0.01]}},
+    },
+}
+
+
+def make_push_env(
+    n_envs: int = 1,
+    use_async_envs: bool = False,
+    variants: Sequence[str] | None = None,
+    **kwargs: Any,
+) -> dict[str, dict[int, Any]]:
+    """One push scene per cube variant: ``{"so101_push_<variant>": {0: vector_env}}``.
+
+    ``variants`` names entries of ``CUBE_VARIANTS`` (all by default); ``kwargs`` override ``SO101Env``'s.
+    """
+    vector_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
+    envs = {}
+    for name in variants or CUBE_VARIANTS:
+        config = {**PUSH_DEFAULTS, "scene": repo_root() / PUSH_SCENE_FILE, "cube": name, **kwargs}
+        envs[f"so101_push_{name}"] = {0: vector_cls([partial(SO101Env, **config)] * n_envs)}
+    return envs

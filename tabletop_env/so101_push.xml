@@ -1,0 +1,78 @@
+<!--
+  SO-101 pushing scene: one 3 cm cube and a flat green target pad on a table, in a simple room.
+
+  The cube's mass, friction and material are set per variant by `CUBE_VARIANTS` in env.py, applied to
+  the `cube_geom` geom before compiling; the values below are only the defaults.
+  The cube geom has priority="1" so its friction, not the max of cube and table, sets the contact.
+  The target is named `box` so env.py's in-box success check applies: the cube's center is over the
+  pad and below 6 cm. It is visual only, so the cube slides over it.
+-->
+<mujoco model="so101_push">
+  <statistic center="0.2 0 0.1" extent="0.6"/>
+
+  <visual>
+    <headlight diffuse="0.35 0.35 0.35" ambient="0.2 0.2 0.2" specular="0 0 0"/>
+    <global azimuth="160" elevation="-20"/>
+  </visual>
+
+  <custom>
+    <text name="instruction" data="Push the cube onto the green target."/>
+  </custom>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.75 0.75 0.75" rgb2="0.45 0.45 0.45" width="512" height="3072"/>
+    <material name="table" rgba="0.80 0.72 0.60 1" specular="0.05" shininess="0.1"/>
+    <!-- Cube materials, one per variant in env.py's CUBE_VARIANTS. -->
+    <texture name="wood" type="cube" file="textures/wood.png"/>
+    <material name="red_wood" texture="wood" rgba="0.95 0.15 0.12 1" specular="0.2" shininess="0.3"/>
+    <material name="steel" rgba="0.62 0.64 0.67 1" specular="0.9" shininess="0.9" reflectance="0.2"/>
+    <material name="rubber" rgba="0.12 0.12 0.13 1" specular="0.05" shininess="0.05"/>
+    <material name="ice" rgba="0.75 0.90 1.0 0.85" specular="0.8" shininess="0.8"/>
+    <material name="table_leg" rgba="0.30 0.25 0.20 1"/>
+    <material name="floor" rgba="0.38 0.37 0.36 1"/>
+    <material name="wall" rgba="0.85 0.84 0.80 1" emission="0.5"/>
+    <material name="target" rgba="0.22 0.60 0.33 1" specular="0.1"/>
+  </asset>
+
+  <default>
+    <default class="cube">
+      <geom type="box" size="0.015 0.015 0.015" mass="0.016" condim="4" friction="0.6 0.01 0.001"
+            solref="0.01 1" priority="1"/>
+    </default>
+    <!-- Room, table legs and target pad: visual only. -->
+    <default class="decor">
+      <geom type="box" contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
+    <light pos="0.3 -0.4 0.8" dir="-0.3 0.5 -1" diffuse="0.25 0.25 0.25" castshadow="true"/>
+    <!-- Table: an 80 x 80 cm top, its surface at z = 0, on 75 cm legs. -->
+    <geom name="table" type="box" size="0.40 0.40 0.015" pos="0.20 0 -0.015" material="table"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.56 0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.56 -0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="-0.16 0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="-0.16 -0.36 -0.39" material="table_leg"/>
+
+    <!-- Room: a floor and three 2 m walls around the table. -->
+    <geom name="floor" type="plane" size="1.0 1.5 0.05" pos="0 0 -0.75" material="floor"/>
+    <geom class="decor" size="0.02 1.5 1.0" pos="-1.0 0 0.25" material="wall"/>
+    <geom class="decor" size="1.0 0.02 1.0" pos="0 1.5 0.25" material="wall"/>
+    <geom class="decor" size="1.0 0.02 1.0" pos="0 -1.5 0.25" material="wall"/>
+
+    <site name="so101_mount" pos="0 0 0"/>
+
+    <body name="cube" pos="0.23 -0.06 0.015">
+      <freejoint/>
+      <geom name="cube_geom" class="cube" material="red_wood"/>
+    </body>
+    <!-- Target pad: 9 cm square, the same footprint as the tabletop scene's box interior. -->
+    <body name="box" pos="0.22 0.125 0">
+      <geom class="decor" size="0.045 0.045 0.0005" pos="0 0 0.0005" material="target"/>
+    </body>
+
+    <camera name="front" pos="0.5 0 0.2" xyaxes="0 1 0 -0.493 0 0.87" fovy="60"/>
+    <camera name="top" pos="0.2 0 0.48" xyaxes="0 -1 0 1 0 0" fovy="60"/>
+  </worldbody>
+</mujoco>
