@@ -1,8 +1,72 @@
+import threading
+
+import glfw
 import mujoco
 import mujoco.viewer
 import numpy as np
 from tabletop_env.env import make_push_env
-from force_controller import SO101ForceController
+from force_controller import ResolvedRateController
+
+DESIRED_DISTANCE = 0.20
+
+
+def _wait_for_space(viewer, data, previous_time, continue_event, stage):
+    continue_event.clear()
+    viewer.set_texts(
+        (
+            mujoco.mjtFontScale.mjFONTSCALE_150,
+            mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            f"{stage} reached",
+            "Press Space to continue",
+        )
+    )
+    print(f"{stage} reached. Press Space in the viewer to continue.")
+
+    while viewer.is_running():
+        if data.time < previous_time:
+            viewer.clear_texts()
+            return "reset"
+        if continue_event.wait(0.05):
+            viewer.clear_texts()
+            return "continue"
+
+    viewer.clear_texts()
+    return "closed"
+
+
+def _move_to_home(world, home_joints):
+    model, data = world.model, world.data
+    home_target = world.to_ctrl(np.asarray(home_joints, dtype=float))
+    data.ctrl[world.actuators] = home_target
+    home_joint_ids = model.actuator_trnid[world.actuators, 0]
+    home_dof_ids = model.jnt_dofadr[home_joint_ids]
+    control_dt = model.opt.timestep * world.substeps
+    max_steps = int(np.ceil(5.0 / control_dt))
+    position_tolerance = np.deg2rad(1.0)
+    velocity_tolerance = 0.02
+
+    for _ in range(max_steps):
+        mujoco.mj_step(model, data, nstep=world.substeps)
+        position_error = np.max(np.abs(data.qpos[world.qadr] - home_target))
+        max_joint_speed = np.max(np.abs(data.qvel[home_dof_ids]))
+        if (
+            position_error <= position_tolerance
+            and max_joint_speed <= velocity_tolerance
+        ):
+            return
+
+    raise TimeoutError(
+        "Robot did not settle at home within 5 seconds "
+        f"(position error {position_error:.4f} rad, "
+        f"max joint speed {max_joint_speed:.4f} rad/s)."
+    )
+
+
+def _reset_to_home(robot_env):
+    robot_env.reset()
+    world = robot_env._ensure_world()
+    _move_to_home(world, robot_env.initial_joints)
+    return world
 
 
 def _start_in_contact(world):
@@ -82,56 +146,166 @@ def _start_in_contact(world):
     return push_direction
 
 
+def _measure_push_force(world, cube_geom_id, push_direction, base_id):
+    """Estimate the robot-on-cube force magnitude from MuJoCo contact wrenches."""
+    model, data = world.model, world.data
+    push_force_magnitude = 0.0
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        if cube_geom_id not in (contact.geom1, contact.geom2):
+            continue
+        other_geom = contact.geom2 if contact.geom1 == cube_geom_id else contact.geom1
+        body_id = int(model.geom_bodyid[other_geom])
+        while body_id > 0 and body_id != base_id:
+            body_id = int(model.body_parentid[body_id])
+        if body_id != base_id:
+            continue
+
+        contact_wrench = np.zeros(6)
+        mujoco.mj_contactForce(model, data, contact_id, contact_wrench)
+        contact_frame = contact.frame.reshape(3, 3)
+        force_world = contact_frame.T @ contact_wrench[:3]
+        push_force_magnitude += abs(float(np.dot(force_world, push_direction)))
+
+    return push_force_magnitude * push_direction
+
+
+def _start_push(world):
+    model, data = world.model, world.data
+    push_direction = _start_in_contact(world)
+    controller = ResolvedRateController(
+        model,
+        data,
+        joint_names=(
+            "shoulder_pan",
+            "shoulder_lift",
+            "elbow_flex",
+            "wrist_flex",
+            "wrist_roll",
+        ),
+        site_name="gripperframe",
+        force_gain=0.03,
+        damping=0.01,
+        position_gain=4.0,
+        nullspace_gain=0.0,
+        max_cartesian_speed=0.08,
+        max_joint_speed=1.5,
+    )
+    initial_cube_pos, _ = controller.get_object_state("cube")
+    initial_site_pos = data.site_xpos[controller.site_id].copy()
+    contact_offset = initial_site_pos - initial_cube_pos
+    cube_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base")
+    goal_pos = initial_cube_pos + DESIRED_DISTANCE * push_direction
+
+    print(f"Initial Cube Position (XYZ): {initial_cube_pos}")
+    print(f"Target Cube Position (XYZ):  {goal_pos}")
+    print(f"Push Direction (XYZ):        {push_direction}")
+
+    return (
+        controller,
+        initial_cube_pos,
+        push_direction,
+        contact_offset,
+        cube_geom_id,
+        base_id,
+    )
+
+
 def main():
-    CUBE = "ice"
+    CUBE = "steel"
     envs = make_push_env(n_envs=1, variants=[CUBE])
     vec_env = envs[f"so101_push_{CUBE}"][0]
 
     try:
         robot_env = vec_env.envs[0].unwrapped
-        robot_env.reset()
-
         world = robot_env._ensure_world()
         model = world.model
         data = world.data
-        push_direction = _start_in_contact(world)
-        controller = SO101ForceController(model, data, contact_site_name="gripperframe")
+        kp_pos = 2.0
+        kd_vel = 0.1
+        max_force = 0.1
+        control_dt = model.opt.timestep * world.substeps
+        continue_event = threading.Event()
 
-        initial_cube_pos, _ = controller.get_object_state("cube")
-        desired_distance = 0.20
-        goal_pos = initial_cube_pos + desired_distance * push_direction
+        def key_callback(key):
+            if key == glfw.KEY_SPACE:
+                continue_event.set()
 
-        print(f"Initial Cube Position (XYZ): {initial_cube_pos}")
-        print(f"Target Cube Position (XYZ):  {goal_pos}")
-        print(f"Push Direction (XYZ):        {push_direction}")
-
-        kp_pos = 8.0
-        kd_vel = 0.5
-        max_force = 1.0
-
-        with mujoco.viewer.launch_passive(model, data) as viewer:
+        with mujoco.viewer.launch_passive(
+            model, data, key_callback=key_callback
+        ) as viewer:
             while viewer.is_running():
-                cube_pos, cube_vel = controller.get_object_state("cube")
-                pos_error = goal_pos - cube_pos
-                vel_error = -cube_vel[:3]
-                force_linear = (kp_pos * pos_error) + (kd_vel * vel_error)
-
-                pushed_distance = np.dot(cube_pos - initial_cube_pos, push_direction)
-                if pushed_distance >= desired_distance:
-                    force_linear = np.zeros(3)
-
-                force_magnitude = np.linalg.norm(force_linear)
-                if force_magnitude > max_force:
-                    force_linear = (force_linear / force_magnitude) * max_force
-
-                force_command = np.zeros(6)
-                force_command[:3] = force_linear
-                controller.apply_force_command(force_command)
-
-                for _ in range(world.substeps):
-                    mujoco.mj_step(model, data)
-
+                with viewer.lock():
+                    world = _reset_to_home(robot_env)
+                stage_time = data.time
                 viewer.sync()
+                stage = _wait_for_space(
+                    viewer, data, stage_time, continue_event, "Home"
+                )
+                if stage == "closed":
+                    break
+                if stage == "reset":
+                    print("Reset detected; returning to the home pose.")
+                    continue
+
+                with viewer.lock():
+                    (
+                        controller,
+                        initial_cube_pos,
+                        push_direction,
+                        contact_offset,
+                        cube_geom_id,
+                        base_id,
+                    ) = _start_push(world)
+                stage_time = data.time
+                viewer.sync()
+                stage = _wait_for_space(
+                    viewer, data, stage_time, continue_event, "Initial contact"
+                )
+                if stage == "closed":
+                    break
+                if stage == "reset":
+                    print("Reset detected; returning to the home pose.")
+                    continue
+
+                previous_time = data.time
+                while viewer.is_running():
+                    if data.time < previous_time:
+                        print("Reset detected; returning to the home pose.")
+                        break
+
+                    cube_pos, cube_vel = controller.get_object_state("cube")
+                    progress = float(
+                        np.dot(cube_pos - initial_cube_pos, push_direction)
+                    )
+                    push_speed = float(np.dot(cube_vel[:3], push_direction))
+                    force_magnitude = max(
+                        0.0,
+                        kp_pos * (DESIRED_DISTANCE - progress) - kd_vel * push_speed,
+                    )
+                    force_magnitude = min(force_magnitude, max_force)
+                    force_linear = force_magnitude * push_direction
+                    contact_target = cube_pos + contact_offset
+                    measured_force = _measure_push_force(
+                        world, cube_geom_id, push_direction, base_id
+                    )
+
+                    controller.step(
+                        force_linear,
+                        dt=control_dt,
+                        position_reference=contact_target,
+                        motion_direction=push_direction,
+                        predicted_velocity=cube_vel[:3],
+                        track_position_reference=True,
+                        measured_force=measured_force,
+                    )
+
+                    for _ in range(world.substeps):
+                        mujoco.mj_step(model, data)
+
+                    previous_time = data.time
+                    viewer.sync()
     finally:
         vec_env.close()
 

@@ -53,7 +53,7 @@ ARM_COLOR = (0.30, 0.62, 0.68)
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 # Arm folded above the table, gripper half open, in the units of the observation and action.
-HOME = (0.0, -60.0, 60.0, 35.0, 0.0, 30.0)
+HOME = (0.0, -60.0, 60.0, 35.0, 0.0, 0.0)
 JOINT_NAMES = [f"{joint}.pos" for joint in JOINTS]
 
 # How the LeRobot simulator server describes this environment (ignored in-process).
